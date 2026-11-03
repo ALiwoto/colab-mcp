@@ -7,6 +7,39 @@
     let retryTimer = null;
     let retryDelay = 1000;
     let lastOperation = null;
+    const extensionRequests = new Map();
+    const bridge = {context: notebookContext};
+    window[Symbol.for("colab-mcp.companion")] = bridge;
+
+    function extensionRequest(action, parameters = {}) {
+        const id = crypto.randomUUID();
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                extensionRequests.delete(id);
+                reject(new Error("The Chrome tab service did not respond. Reload the extension and this tab."));
+            }, 30000);
+            extensionRequests.set(id, {resolve, reject, timer});
+            window.postMessage({channel: "colab-mcp-extension-request", id, action, parameters}, location.origin);
+        });
+    }
+
+    window.addEventListener("message", event => {
+        if (event.source !== window || event.origin !== location.origin
+            || event.data?.channel !== "colab-mcp-extension-response") {
+            return;
+        }
+        const pending = extensionRequests.get(event.data.id);
+        if (!pending) {
+            return;
+        }
+        clearTimeout(pending.timer);
+        extensionRequests.delete(event.data.id);
+        if (event.data.error) {
+            pending.reject(new Error(event.data.error));
+        } else {
+            pending.resolve(event.data.result);
+        }
+    });
 
     function notebookContext() {
         const notebook = window.colab?.global?.notebook;
@@ -93,6 +126,9 @@
 
     function startAction(parameters) {
         const {kernel} = notebookContext();
+        if (bridge.files?.active && parameters.action !== "interrupt") {
+            throw new Error("Finish or cancel the file transfer before changing the runtime.");
+        }
         if (lastOperation?.state === "running") {
             throw new Error("A runtime operation is still running. Check runtime_status and the Colab tab.");
         }
@@ -117,7 +153,7 @@
         return runtimeStatus();
     }
 
-    function handleMessage(event, connection) {
+    async function handleMessage(event, connection) {
         let request;
         try {
             request = JSON.parse(event.data);
@@ -126,6 +162,11 @@
                 jsonrpc: "2.0", id: null,
                 error: {code: -32700, message: "Invalid JSON"},
             }));
+            return;
+        }
+        if (request?.method === "browser/connect_tab" && !Object.hasOwn(request, "id")) {
+            extensionRequest("connect_tab", request.params)
+                .catch(error => console.warn("Colab MCP tab switch:", error.message));
             return;
         }
         if (!request || !Object.hasOwn(request, "id") || !request.method) {
@@ -140,8 +181,18 @@
                 case "runtime/action":
                     response.result = startAction(request.params);
                     break;
+                case "browser/list_tabs":
+                    response.result = await extensionRequest("list_tabs");
+                    break;
+                case "browser/prepare_tab":
+                    response.result = await extensionRequest("prepare_tab", request.params);
+                    break;
                 default:
-                    response.error = {code: -32601, message: "Unknown companion method"};
+                    if (request.method.startsWith("files/") && bridge.files) {
+                        response.result = await bridge.files.request(request.method, request.params);
+                    } else {
+                        response.error = {code: -32601, message: "Unknown companion method"};
+                    }
             }
         } catch (error) {
             response.error = {code: -32000, message: error.message};
@@ -165,6 +216,20 @@
         return {token, port};
     }
 
+    // Auto-accept only the MCP dialog whose known token matches this tab's connection.
+    // Sign-in, browser permissions, and runtime deletion dialogs remain Colab's responsibility.
+    customElements.whenDefined("colab-local-mcp-connect-dialog").then(() => {
+        const Dialog = customElements.get("colab-local-mcp-connect-dialog");
+        const originalShow = Dialog.prototype.show;
+        Dialog.prototype.show = function (...args) {
+            const auth = credentials();
+            if (auth && this.knownInput === `${auth.token}&${auth.port}`) {
+                return Promise.resolve(this.knownInput);
+            }
+            return originalShow.apply(this, args);
+        };
+    });
+
     function scheduleConnection() {
         clearTimeout(retryTimer);
         retryTimer = setTimeout(connect, retryDelay);
@@ -178,7 +243,7 @@
         if (!auth) {
             return;
         }
-        // Wait for the normal MCP approval; the extension never replaces that connection.
+        // The normal Colab MCP connection remains separate from the companion channel.
         if (!window.colab?.global?.notebook?.localColabMcpService?.isConnected()) {
             scheduleConnection();
             return;
@@ -194,6 +259,7 @@
         connection.onmessage = event => handleMessage(event, connection);
         connection.onclose = () => {
             socket = null;
+            bridge.files?.close();
             retryDelay = Math.min(retryDelay * 2, 10000);
             scheduleConnection();
         };
@@ -204,6 +270,7 @@
             connect();
         }
     });
+    window.addEventListener("colab-mcp-credentials-changed", connect);
     window.addEventListener("pagehide", () => {
         clearTimeout(retryTimer);
         if (socket) {

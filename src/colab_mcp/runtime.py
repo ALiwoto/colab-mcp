@@ -1,8 +1,10 @@
 """Optional runtime controls supplied by the Chrome companion."""
 
-import json
+import asyncio
 
 from minimcp import Peer, RpcError
+
+from .results import tool_result
 
 
 STATUS_TOOL = "runtime_status"
@@ -55,6 +57,7 @@ RUNTIME_TOOLS = [
 class RuntimeBridge:
     def __init__(self):
         self.peer: Peer | None = None
+        self.ready = asyncio.Event()
 
     async def connect(self, websocket):
         async def on_request(method, params):
@@ -64,14 +67,17 @@ class RuntimeBridge:
 
         async with Peer(websocket, on_request) as peer:
             self.peer = peer
+            self.ready.set()
             try:
                 await peer.closed.wait()
             finally:
                 self.peer = None
+                self.ready.clear()
 
     async def disconnect(self):
         peer = self.peer
         self.peer = None
+        self.ready.clear()
         if peer is not None:
             await peer.transport.close(code=1000, reason="Notebook disconnected")
 
@@ -117,8 +123,4 @@ class RuntimeBridge:
             except RpcError as exc:
                 result = {"message": str(exc)}
                 is_error = True
-        return {
-            "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
-            "structuredContent": result,
-            "isError": is_error,
-        }
+        return tool_result(result, is_error=is_error)

@@ -63,11 +63,16 @@ class ColabWebSocketServer:
         if callback is None:
             await websocket.close(code=1008, reason="Runtime companion is not enabled")
             return
-        if lock.locked():
+        try:
+            # A tab handoff may arrive while the previous channel is still closing.
+            await asyncio.wait_for(lock.acquire(), timeout=5)
+        except TimeoutError:
             await websocket.close(code=1013, reason="This Colab channel is already connected")
             return
-        async with lock:
+        try:
             await callback(websocket)
+        finally:
+            lock.release()
 
     async def __aenter__(self):
         self._server = await serve(
