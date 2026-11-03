@@ -18,13 +18,19 @@ SCRATCH_PATH = "/notebooks/empty.ipynb"
 
 
 class ColabWebSocketServer:
-    """One authenticated Colab tab, listening only on IPv4 loopback."""
+    """A Colab tab and optional companion, listening only on IPv4 loopback."""
 
-    def __init__(self, on_connection: Callable[[ServerConnection], Awaitable[None]]):
+    def __init__(
+        self,
+        on_connection: Callable[[ServerConnection], Awaitable[None]],
+        on_runtime_connection: Callable[[ServerConnection], Awaitable[None]] | None = None,
+    ):
         self.port = 0
         self.token = secrets.token_urlsafe(32)
         self._on_connection = on_connection
         self._connection_lock = asyncio.Lock()
+        self._on_runtime_connection = on_runtime_connection
+        self._runtime_lock = asyncio.Lock()
         self._server = None
 
     def _authorize(self, connection, request):
@@ -49,11 +55,19 @@ class ColabWebSocketServer:
         return None
 
     async def _handle_connection(self, websocket):
-        if self._connection_lock.locked():
-            await websocket.close(code=1013, reason="A Colab tab is already connected")
+        callback = self._on_connection
+        lock = self._connection_lock
+        if urlsplit(websocket.request.path).path == "/runtime":
+            callback = self._on_runtime_connection
+            lock = self._runtime_lock
+        if callback is None:
+            await websocket.close(code=1008, reason="Runtime companion is not enabled")
             return
-        async with self._connection_lock:
-            await self._on_connection(websocket)
+        if lock.locked():
+            await websocket.close(code=1013, reason="This Colab channel is already connected")
+            return
+        async with lock:
+            await callback(websocket)
 
     async def __aenter__(self):
         self._server = await serve(

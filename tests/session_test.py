@@ -52,7 +52,9 @@ def test_discovery_and_bidirectional_requests():
         async with ColabSessionProxy(wire) as proxy:
             await wire.initialize({"roots": {"listChanged": True}})
             before = await wire.call(1, "tools/list")
-            assert [tool["name"] for tool in before["result"]["tools"]] == [CONNECTION_TOOL_NAME]
+            assert {
+                CONNECTION_TOOL_NAME, "list_notebook_tools", "call_notebook_tool",
+            } <= {tool["name"] for tool in before["result"]["tools"]}
             async with browser_connection(proxy) as browser:
                 init = await initialize_browser(browser, proxy, {
                     "tools": {}, "resources": {}, "prompts": {},
@@ -67,7 +69,7 @@ def test_discovery_and_bidirectional_requests():
                 request = await receive_browser(browser)
                 await reply_browser(browser, request, {"tools": [remote_tool], "nextCursor": "page2"})
                 listing = (await wire.response(2))["result"]
-                assert listing["tools"][1] == remote_tool
+                assert remote_tool in listing["tools"]
                 assert listing["nextCursor"] == "page2"
                 await wire.feed({
                     "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {"cursor": "page2"},
@@ -77,11 +79,34 @@ def test_discovery_and_bidirectional_requests():
                 await reply_browser(browser, request, {"tools": [remote_tool]})
                 assert (await wire.response(3))["result"]["tools"] == [remote_tool]
 
+                # Clients that keep the startup catalog can discover and call tools too.
+                for request_id, arguments, page in [
+                    (7, {}, {"tools": [remote_tool], "nextCursor": "page2"}),
+                    (8, {"cursor": "page2"}, {"tools": [remote_tool]}),
+                ]:
+                    await wire.feed({
+                        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                        "params": {"name": "list_notebook_tools", "arguments": arguments},
+                    })
+                    request = await receive_browser(browser)
+                    assert request["method"] == "tools/list" and request["params"] == arguments
+                    await reply_browser(browser, request, page)
+                    result = (await wire.response(request_id))["result"]
+                    assert result["structuredContent"] == page
+                    assert json.loads(result["content"][0]["text"]) == page
+
                 params = {
                     "name": "read_notebook", "arguments": {},
                     "_meta": {"progressToken": "progress-1"},
                 }
-                await wire.feed({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": params})
+                await wire.feed({
+                    "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {
+                        "name": "call_notebook_tool",
+                        "arguments": {"name": "read_notebook", "arguments": {}},
+                        "_meta": params["_meta"],
+                    },
+                })
                 call = await receive_browser(browser)
                 assert call["params"] == params
                 # The same ID may be in flight simultaneously in both directions.
@@ -166,7 +191,7 @@ def test_cancellation_errors_and_reconnection():
                 request = await receive_browser(replacement)
                 new_tool = {"name": "new_notebook_tool", "inputSchema": {"type": "object"}}
                 await reply_browser(replacement, request, {"tools": [new_tool]})
-                assert (await wire.response(14))["result"]["tools"][1:] == [new_tool]
+                assert new_tool in (await wire.response(14))["result"]["tools"]
 
     asyncio.run(scenario())
 

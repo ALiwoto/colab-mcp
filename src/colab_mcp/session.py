@@ -3,12 +3,14 @@
 
 import asyncio
 from contextlib import AsyncExitStack, suppress
+import json
 import logging
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import webbrowser
 
 from minimcp import Peer, RpcError, ServerSession, initialize_client
 
+from .runtime import ACTION_TOOL, RUNTIME_TOOLS, STATUS_TOOL, RuntimeBridge
 from .websocket_server import COLAB, COLAB_ALT_DOMAIN, SCRATCH_PATH, ColabWebSocketServer
 
 UI_CONNECTION_TIMEOUT = 60
@@ -35,6 +37,40 @@ CONNECTION_TOOL = {
         "properties": {"result": {"type": "boolean"}},
         "required": ["result"],
     },
+}
+NOTEBOOK_LIST_TOOL = {
+    "name": "list_notebook_tools",
+    "description": (
+        "List the connected Colab browser's tools and their input schemas. "
+        "Call after open_colab_browser_connection, then use call_notebook_tool. "
+        "If nextCursor is returned, pass it as cursor to read the next page."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"cursor": {"type": "string"}},
+        "additionalProperties": False,
+    },
+    "annotations": {"readOnlyHint": True},
+}
+NOTEBOOK_CALL_TOOL = {
+    "name": "call_notebook_tool",
+    "description": (
+        "Call a tool provided by the connected Colab browser. First use "
+        "list_notebook_tools to get its exact name and argument schema."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Browser tool name."},
+            "arguments": {"type": "object", "description": "Arguments matching its input schema."},
+        },
+        "required": ["name", "arguments"],
+        "additionalProperties": False,
+    },
+}
+LOCAL_TOOLS = {
+    tool["name"]: tool
+    for tool in (CONNECTION_TOOL, NOTEBOOK_LIST_TOOL, NOTEBOOK_CALL_TOOL, *RUNTIME_TOOLS)
 }
 
 LIST_METHODS = {
@@ -68,7 +104,8 @@ class ColabSessionProxy:
         self.connected = asyncio.Event()
         self.browser: Peer | None = None
         self.browser_capabilities = {}
-        self.wss = ColabWebSocketServer(self._connect_browser)
+        self.runtime = RuntimeBridge()
+        self.wss = ColabWebSocketServer(self._connect_browser, self._connect_runtime)
         self.server = ServerSession(
             transport,
             name="ColabMCP",
@@ -84,7 +121,10 @@ class ColabSessionProxy:
             on_notification=self._client_notification,
             instructions=(
                 "Call open_colab_browser_connection to connect a Colab browser tab. "
-                "Notebook tools become available after connection. "
+                "Then use list_notebook_tools and call_notebook_tool to discover "
+                "and use its notebook operations. "
+                "Optional Chrome companion: runtime_status reports availability; "
+                "runtime_action manages the runtime when it is connected. "
                 "The user handles Google sign-in and any Colab permission prompts."
             ),
         )
@@ -125,8 +165,15 @@ class ColabSessionProxy:
             self.browser = None
             self.browser_capabilities = {}
             self.connected.clear()
+            await self.runtime.disconnect()
             if was_connected:
                 await self._catalog_changed()
+
+    async def _connect_runtime(self, websocket):
+        if not self.connected.is_set():
+            await websocket.close(code=1013, reason="Connect the Colab notebook first")
+            return
+        await self.runtime.connect(websocket)
 
     async def _catalog_changed(self):
         if self.server.peer.closed.is_set():
@@ -153,11 +200,47 @@ class ColabSessionProxy:
                 await self.browser.notify(method, params)
 
     async def _request(self, method, params):
-        if method == "tools/call" and params.get("name") == CONNECTION_TOOL_NAME:
+        if method == "tools/call" and params.get("name") in LOCAL_TOOLS:
+            name = params["name"]
             arguments = params.get("arguments", {})
-            if not isinstance(arguments, dict) or arguments.keys() - {"notebook_url"}:
-                raise RpcError(-32602, "Expected optional notebook_url argument")
-            return await self._open_browser(arguments.get("notebook_url"), params.get("_meta", {}))
+            schema = LOCAL_TOOLS[name]["inputSchema"]
+            if (
+                not isinstance(arguments, dict)
+                or arguments.keys() - schema["properties"].keys()
+                or set(schema.get("required", [])) - arguments.keys()
+            ):
+                raise RpcError(-32602, f"Invalid arguments for {name}")
+            if name == CONNECTION_TOOL_NAME:
+                return await self._open_browser(arguments.get("notebook_url"), params.get("_meta", {}))
+            if name in (STATUS_TOOL, ACTION_TOOL):
+                return await self.runtime.call(name, arguments)
+            if name == NOTEBOOK_LIST_TOOL["name"]:
+                if "cursor" in arguments and not isinstance(arguments["cursor"], str):
+                    raise RpcError(-32602, "cursor must be a string")
+                result = await self._forward("tools/list", arguments)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                    "structuredContent": result,
+                    "isError": False,
+                }
+            if not isinstance(arguments["name"], str) or not isinstance(arguments["arguments"], dict):
+                raise RpcError(-32602, "Expected a tool name and an arguments object")
+            return await self._forward("tools/call", {**params, **arguments})
+        result = await self._forward(method, params)
+        if method == "tools/list":
+            tools = result.get("tools")
+            if not isinstance(tools, list) or any(
+                not isinstance(tool, dict) or not isinstance(tool.get("name"), str)
+                for tool in tools
+            ):
+                raise RpcError(-32603, "Colab returned an invalid tool list")
+            tools = [tool for tool in tools if tool["name"] not in LOCAL_TOOLS]
+            if not params.get("cursor"):
+                tools = [*LOCAL_TOOLS.values(), *tools]
+            return {**result, "tools": tools}
+        return result
+
+    async def _forward(self, method, params):
         capability = METHOD_CAPABILITIES.get(method)
         if capability is None:
             raise RpcError(-32601, f"Unknown method: {method}")
@@ -169,21 +252,8 @@ class ColabSessionProxy:
                 raise RpcError(
                     -32602, "Notebook connection changed; restart listing without a cursor"
                 )
-            result = {LIST_METHODS[method]: []}
-        else:
-            result = await browser.request(method, params)
-        if method == "tools/list":
-            tools = result.get("tools")
-            if not isinstance(tools, list) or any(
-                not isinstance(tool, dict) or not isinstance(tool.get("name"), str)
-                for tool in tools
-            ):
-                raise RpcError(-32603, "Colab returned an invalid tool list")
-            tools = [tool for tool in tools if tool["name"] != CONNECTION_TOOL_NAME]
-            if not params.get("cursor"):
-                tools.insert(0, CONNECTION_TOOL)
-            return {**result, "tools": tools}
-        return result
+            return {LIST_METHODS[method]: []}
+        return await browser.request(method, params)
 
     def connection_url(self, notebook_url=None):
         if notebook_url is None:
